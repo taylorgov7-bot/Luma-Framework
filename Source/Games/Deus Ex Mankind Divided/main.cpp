@@ -173,7 +173,7 @@ namespace
         {
             const float x = data[i], y = data[i + 1];
             if (x <= 0.f || y <= 0.f) continue;
-            for (uint32_t k = 0; k <= 3; ++k)
+            for (uint32_t k = 0; k <= 5 /*k_max_patched_fraction_shift*/; ++k)
             {
                 const uint32_t w = base_w >> k, h = base_h >> k;
                 if (w == 0 || h == 0) break;
@@ -196,6 +196,9 @@ namespace
     struct PendingMap { uint64_t resource; void* data; uint32_t size; };
     thread_local std::vector<PendingMap> t_pending_maps;
     constexpr uint32_t k_max_patched_cbuffer_size = 1024;
+    // Textures are resized down to 1/128 of the screen, constants are only patched down to 1/32 (smaller pairs like (20, 11) are too likely to be unrelated values)
+    constexpr uint32_t k_max_scaled_fraction_shift = 7;
+    constexpr uint32_t k_max_patched_fraction_shift = 5;
 
     // Diagnostics capture (records every draw/dispatch of one frame, so we can design render scaling)
     enum class CaptureState : int { Idle, Requested, Capturing };
@@ -320,10 +323,14 @@ public:
         const uint32_t base_w = (uint32_t)device_data->output_resolution.x, base_h = (uint32_t)device_data->output_resolution.y;
         if (base_w <= 16 || base_h <= 16) return false; // Swapchain not known yet
 
-        for (uint32_t k = 0; k <= 3; ++k)
+        // Screen fractions from 1/1 down to 1/128 (e.g. the depth of field and bloom chains), with either rounding (down or up)
+        for (uint32_t k = 0; k <= k_max_scaled_fraction_shift; ++k)
         {
-            const uint32_t w = base_w >> k, h = base_h >> k;
-            if (desc.texture.width != w || desc.texture.height != h) continue;
+            const uint32_t div = 1u << k;
+            const uint32_t w_floor = base_w / div, h_floor = base_h / div;
+            const uint32_t w_ceil = (base_w + div - 1) / div, h_ceil = (base_h + div - 1) / div;
+            const uint32_t w = desc.texture.width, h = desc.texture.height;
+            if (w == 0 || h == 0 || (w != w_floor && w != w_ceil) || (h != h_floor && h != h_ceil)) continue;
 
             g_scale_base_width = base_w;
             g_scale_base_height = base_h;
@@ -1364,7 +1371,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
     if (ul_reason_for_call == DLL_PROCESS_ATTACH)
     {
         Globals::SetGlobals(PROJECT_NAME, "Deus Ex: Mankind Divided Luma mod");
-        Globals::VERSION = 5;
+        Globals::VERSION = 6;
 
         // DLSS only: keep the game's original swapchain, texture formats and colors (no HDR, no display composition).
         swapchain_format_upgrade_type = TextureFormatUpgradesType::None;
