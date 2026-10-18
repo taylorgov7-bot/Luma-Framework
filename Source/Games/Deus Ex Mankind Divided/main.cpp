@@ -108,6 +108,56 @@ namespace
         return (std::max)(1u, (uint32_t)std::lround((double)full * (double)GetActiveScale()));
     }
 
+    // Returns the scaled size of a texture dimension if it's derived from the screen size "full" in one of the ways the game does it, 0 otherwise:
+    // - fractions of the screen: full * (1, 2 or 3/4) / 2^k (k = 0..7), rounded down or up (render targets, bloom/depth of field chains, atlases)
+    // - tile rows: m * ceil(full / (16 * 2^k)), with m = 4 or 5 (depth of field tile data, which stores 4 or 5 rows per 16 pixels tile)
+    // Some values are ambiguous (e.g. 180 is both 1440/8 and 4 * ceil(1440/32)), so integer textures (the tile data) try the tile rows rule first.
+    uint32_t MatchScreenDerivedDimension(uint32_t value, uint32_t full, bool prefer_tiles)
+    {
+        if (value == 0 || full == 0) return 0;
+        const uint32_t scaled_full = GetScaledFullDimension(full);
+
+        auto MatchFractions = [&]() -> uint32_t
+        {
+            struct Multiplier { uint32_t num, den; };
+            constexpr Multiplier multipliers[] = { { 1, 1 }, { 2, 1 }, { 3, 4 } };
+            for (uint32_t k = 0; k <= 7; ++k)
+            {
+                const uint64_t div = 1ull << k;
+                for (const auto& m : multipliers)
+                {
+                    const uint64_t numerator = (uint64_t)full * m.num, denominator = (uint64_t)m.den * div;
+                    const uint64_t v_floor = numerator / denominator, v_ceil = (numerator + denominator - 1) / denominator;
+                    if (value == v_floor || value == v_ceil)
+                        return (std::max)(1u, (uint32_t)std::lround((double)value * (double)scaled_full / (double)full));
+                }
+            }
+            return 0;
+        };
+        auto MatchTiles = [&]() -> uint32_t
+        {
+            for (uint32_t k = 0; k <= 7; ++k)
+            {
+                const uint64_t tile = 16ull << k;
+                const uint64_t tiles = ((uint64_t)full + tile - 1) / tile;
+                const uint64_t scaled_tiles = ((uint64_t)scaled_full + tile - 1) / tile;
+                for (uint32_t rows : { 4u, 5u })
+                {
+                    if (value == rows * tiles)
+                        return (uint32_t)(rows * scaled_tiles);
+                }
+            }
+            return 0;
+        };
+        if (prefer_tiles)
+        {
+            if (uint32_t result = MatchTiles()) return result;
+            return MatchFractions();
+        }
+        if (uint32_t result = MatchFractions()) return result;
+        return MatchTiles();
+    }
+
     // Base (swapchain) size the resizing was computed against
     std::atomic<uint32_t> g_scale_base_width = 0;
     std::atomic<uint32_t> g_scale_base_height = 0;
@@ -323,21 +373,17 @@ public:
         const uint32_t base_w = (uint32_t)device_data->output_resolution.x, base_h = (uint32_t)device_data->output_resolution.y;
         if (base_w <= 16 || base_h <= 16) return false; // Swapchain not known yet
 
-        // Screen fractions from 1/1 down to 1/128 (e.g. the depth of field and bloom chains), with either rounding (down or up)
-        for (uint32_t k = 0; k <= k_max_scaled_fraction_shift; ++k)
+        const uint32_t w = desc.texture.width, h = desc.texture.height;
+        // Integer formats are the depth of field tile data
+        const bool is_integer = desc.texture.format == reshade::api::format::r32_uint || desc.texture.format == reshade::api::format::r32g32_uint || desc.texture.format == reshade::api::format::r16_uint || desc.texture.format == reshade::api::format::r8_uint;
+        const uint32_t new_w = MatchScreenDerivedDimension(w, base_w, is_integer), new_h = MatchScreenDerivedDimension(h, base_h, is_integer);
+        if (new_w != 0 && new_h != 0)
         {
-            const uint32_t div = 1u << k;
-            const uint32_t w_floor = base_w / div, h_floor = base_h / div;
-            const uint32_t w_ceil = (base_w + div - 1) / div, h_ceil = (base_h + div - 1) / div;
-            const uint32_t w = desc.texture.width, h = desc.texture.height;
-            if (w == 0 || h == 0 || (w != w_floor && w != w_ceil) || (h != h_floor && h != h_ceil)) continue;
-
             g_scale_base_width = base_w;
             g_scale_base_height = base_h;
-            const uint32_t scaled_w = GetScaledFullDimension(base_w), scaled_h = GetScaledFullDimension(base_h);
-            t_pending_resize_info = { w, h, ScaleDimension(w, base_w, scaled_w), ScaleDimension(h, base_h, scaled_h) };
-            desc.texture.width = t_pending_resize_info.scaled_width;
-            desc.texture.height = t_pending_resize_info.scaled_height;
+            t_pending_resize_info = { w, h, new_w, new_h };
+            desc.texture.width = new_w;
+            desc.texture.height = new_h;
             t_pending_resize = true;
             return true;
         }
@@ -1371,7 +1417,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
     if (ul_reason_for_call == DLL_PROCESS_ATTACH)
     {
         Globals::SetGlobals(PROJECT_NAME, "Deus Ex: Mankind Divided Luma mod");
-        Globals::VERSION = 6;
+        Globals::VERSION = 7;
 
         // DLSS only: keep the game's original swapchain, texture formats and colors (no HDR, no display composition).
         swapchain_format_upgrade_type = TextureFormatUpgradesType::None;
