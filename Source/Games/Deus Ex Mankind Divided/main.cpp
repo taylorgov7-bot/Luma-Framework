@@ -16,6 +16,9 @@
 #include <fstream>
 #include <mutex>
 #include <sstream>
+#include <tuple>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 // TODO: Fix this globaly? Define NOMINMAX before including windows.h.
@@ -93,6 +96,10 @@ namespace
     std::vector<PassRecord> g_capture_records;
     constexpr size_t k_max_capture_records = 8000;
 
+    // Bytecode of every shader the game creates (by Luma hash), so the diagnostics can include the disassembly of the shaders used in the captured frame.
+    std::mutex g_shader_bytecode_mutex;
+    std::unordered_map<uint32_t, std::vector<uint8_t>> g_shader_bytecode;
+
     struct TexInfo
     {
         uint32_t w = 0, h = 0, fmt = 0, array = 0, mips = 0, bind = 0;
@@ -157,6 +164,29 @@ public:
             g_addon_directory = file_path.parent_path();
             reshade::register_event<reshade::addon_event::map_buffer_region>(GameDeusExMankindDivided::OnMapBufferRegion);
             reshade::register_event<reshade::addon_event::unmap_buffer_region>(GameDeusExMankindDivided::OnUnmapBufferRegion);
+            reshade::register_event<reshade::addon_event::init_pipeline>(GameDeusExMankindDivided::OnInitPipelineStoreBytecode);
+        }
+    }
+
+    static void OnInitPipelineStoreBytecode(reshade::api::device* device, reshade::api::pipeline_layout layout, uint32_t subobject_count, const reshade::api::pipeline_subobject* subobjects, reshade::api::pipeline pipeline)
+    {
+        SKIP_UNSUPPORTED_DEVICE_API(device->get_api());
+
+        for (uint32_t i = 0; i < subobject_count; ++i)
+        {
+            const auto& subobject = subobjects[i];
+            if (subobject.type != reshade::api::pipeline_subobject_type::vertex_shader
+                && subobject.type != reshade::api::pipeline_subobject_type::pixel_shader
+                && subobject.type != reshade::api::pipeline_subobject_type::compute_shader)
+                continue;
+            const auto* shader_desc = static_cast<const reshade::api::shader_desc*>(subobject.data);
+            if (!shader_desc || !shader_desc->code || shader_desc->code_size == 0)
+                continue;
+            const uint8_t* code = static_cast<const uint8_t*>(shader_desc->code);
+            const uint32_t hash = Shader::BinToHash(code, shader_desc->code_size);
+            std::scoped_lock lock(g_shader_bytecode_mutex);
+            if (!g_shader_bytecode.contains(hash))
+                g_shader_bytecode.emplace(hash, std::vector<uint8_t>(code, code + shader_desc->code_size));
         }
     }
 
@@ -212,7 +242,7 @@ public:
         // Diagnostics
         if (ImGui::CollapsingHeader("Diagnostics (for developing upscaling)"))
         {
-            ImGui::TextWrapped("Load a save, stand somewhere in normal gameplay (not a menu), then press the button. It records one frame and saves Luma_DXMD_Diagnostics.txt next to the game's exe.");
+            ImGui::TextWrapped("Load a save, stand somewhere in normal gameplay (not a menu), then press the button. It records one frame and saves Luma_DXMD_Diagnostics.txt and Luma_DXMD_Shaders.txt next to the game's exe.");
             const bool busy = g_capture_state != CaptureState::Idle;
             ImGui::BeginDisabled(busy);
             if (ImGui::Button("Capture diagnostics"))
@@ -370,19 +400,72 @@ public:
         if (g_capture_records.size() >= k_max_capture_records)
             ss << "(truncated at " << k_max_capture_records << " passes)\n";
 
+        // Unique shaders used this frame, in first-use order, tagged with their stage and first pass index
+        std::vector<std::tuple<uint32_t, const char*, size_t>> used_shaders;
+        {
+            std::unordered_set<uint32_t> seen;
+            for (size_t i = 0; i < g_capture_records.size(); ++i)
+            {
+                const auto& r = g_capture_records[i];
+                const std::pair<uint32_t, const char*> stages[] = { { r.vs, "vs" }, { r.ps, "ps" }, { r.cs, "cs" } };
+                for (const auto& [hash, stage] : stages)
+                {
+                    if (hash != 0 && seen.insert(hash).second)
+                        used_shaders.emplace_back(hash, stage, i);
+                }
+            }
+        }
+
         g_capture_text = ss.str();
         g_capture_records.clear();
 
-        const std::filesystem::path out_path = (g_addon_directory.empty() ? std::filesystem::path(".") : g_addon_directory) / "Luma_DXMD_Diagnostics.txt";
+        const std::filesystem::path out_directory = g_addon_directory.empty() ? std::filesystem::path(".") : g_addon_directory;
+        const std::filesystem::path out_path = out_directory / "Luma_DXMD_Diagnostics.txt";
         std::ofstream file(out_path, std::ios::out | std::ios::trunc);
         if (file)
         {
             file << g_capture_text;
-            g_capture_status = "Saved to " + out_path.string() + " (you can also copy it to the clipboard).";
+            g_capture_status = "Saved " + out_path.string();
         }
         else
         {
-            g_capture_status = "Couldn't write the file, use \"Copy to clipboard\" instead.";
+            g_capture_status = "Couldn't write the diagnostics file, use \"Copy to clipboard\" instead.";
+        }
+
+        // Shader disassembly, all in one file
+        const std::filesystem::path shaders_path = out_directory / "Luma_DXMD_Shaders.txt";
+        std::ofstream shaders_file(shaders_path, std::ios::out | std::ios::trunc);
+        if (shaders_file)
+        {
+            size_t written = 0, missing = 0;
+            std::scoped_lock bytecode_lock(g_shader_bytecode_mutex);
+            for (const auto& [hash, stage, first_pass] : used_shaders)
+            {
+                char header[128];
+                std::snprintf(header, sizeof(header), "\n//////// %s %08X (first used at pass %zu)\n", stage, hash, first_pass);
+                shaders_file << header;
+                auto it = g_shader_bytecode.find(hash);
+                if (it == g_shader_bytecode.end())
+                {
+                    shaders_file << "// bytecode not found\n";
+                    ++missing;
+                    continue;
+                }
+                auto disasm = Shader::DisassembleShader(it->second.data(), it->second.size());
+                if (disasm.has_value())
+                {
+                    shaders_file << disasm.value();
+                    ++written;
+                }
+                else
+                {
+                    shaders_file << "// disassembly failed\n";
+                    ++missing;
+                }
+            }
+            char summary[160];
+            std::snprintf(summary, sizeof(summary), "\nSaved %zu shaders (%zu missing) to ", written, missing);
+            g_capture_status += summary + shaders_path.string();
         }
     }
 
@@ -608,7 +691,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
     if (ul_reason_for_call == DLL_PROCESS_ATTACH)
     {
         Globals::SetGlobals(PROJECT_NAME, "Deus Ex: Mankind Divided Luma mod");
-        Globals::VERSION = 2;
+        Globals::VERSION = 3;
 
         // DLSS only: keep the game's original swapchain, texture formats and colors (no HDR, no display composition).
         swapchain_format_upgrade_type = TextureFormatUpgradesType::None;
