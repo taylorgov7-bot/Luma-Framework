@@ -293,6 +293,10 @@ public:
             reshade::register_event<reshade::addon_event::create_resource>(GameDeusExMankindDivided::OnCreateResourceScale);
             reshade::register_event<reshade::addon_event::init_resource>(GameDeusExMankindDivided::OnInitResourceScale);
             reshade::register_event<reshade::addon_event::destroy_resource>(GameDeusExMankindDivided::OnDestroyResourceScale);
+            reshade::register_event<reshade::addon_event::clear_render_target_view>(GameDeusExMankindDivided::OnClearRenderTargetView);
+            reshade::register_event<reshade::addon_event::clear_depth_stencil_view>(GameDeusExMankindDivided::OnClearDepthStencilView);
+            reshade::register_event<reshade::addon_event::clear_unordered_access_view_float>(GameDeusExMankindDivided::OnClearUnorderedAccessViewFloat);
+            reshade::register_event<reshade::addon_event::clear_unordered_access_view_uint>(GameDeusExMankindDivided::OnClearUnorderedAccessViewUint);
         }
     }
 
@@ -357,6 +361,88 @@ public:
         EraseViews(g_substitute_dsvs);
         EraseViews(g_substitute_srvs);
         EraseViews(g_substitute_uavs);
+    }
+
+    // Clears of resized textures are mirrored on their full resolution substitutes (immediate context only, that's the only one that uses them).
+    // After TAA, a clear also creates the substitute and counts as writing it; before TAA it only clears substitutes that already exist,
+    // so post processing doesn't start reading a cleared substitute instead of the real (low resolution) content.
+    static ID3D11DeviceContext* GetImmediateNativeContext(reshade::api::command_list* cmd_list)
+    {
+        if (!IsScalingActive() || cmd_list->get_device()->get_api() != reshade::api::device_api::d3d11) return nullptr;
+        auto* ctx = reinterpret_cast<ID3D11DeviceContext*>(cmd_list->get_native());
+        if (!ctx || ctx->GetType() != D3D11_DEVICE_CONTEXT_IMMEDIATE) return nullptr;
+        return ctx;
+    }
+
+    template <typename ViewT, typename DescT, typename CreateFunc>
+    static ViewT* GetSubstituteViewForClear(ID3D11Device* dev, ViewT* view, std::unordered_map<uint64_t, SubstituteView<ViewT>>& cache, CreateFunc create)
+    {
+        if (g_post_taa_phase)
+            return GetSubstituteView<ViewT, DescT>(dev, view, cache, false, true, create);
+        // Before TAA: only existing substitutes
+        ComPtr<ID3D11Resource> resource;
+        view->GetResource(resource.put());
+        if (!g_substitutes.contains((uint64_t)resource.get())) return nullptr;
+        return GetSubstituteView<ViewT, DescT>(dev, view, cache, false, false, create);
+    }
+
+    static bool OnClearRenderTargetView(reshade::api::command_list* cmd_list, reshade::api::resource_view rtv, const float color[4], uint32_t rect_count, const reshade::api::rect* rects)
+    {
+        ID3D11DeviceContext* ctx = GetImmediateNativeContext(cmd_list);
+        if (!ctx || rtv.handle == 0) return false;
+        ComPtr<ID3D11Device> dev;
+        ctx->GetDevice(dev.put());
+        std::scoped_lock lock(g_substitutes_mutex);
+        auto Create = [&](ID3D11Resource* r, const D3D11_RENDER_TARGET_VIEW_DESC* d, ID3D11RenderTargetView** o) { return dev->CreateRenderTargetView(r, d, o); };
+        if (auto* substitute = GetSubstituteViewForClear<ID3D11RenderTargetView, D3D11_RENDER_TARGET_VIEW_DESC>(dev.get(), reinterpret_cast<ID3D11RenderTargetView*>(rtv.handle), g_substitute_rtvs, Create))
+            ctx->ClearRenderTargetView(substitute, color);
+        return false; // The original still gets cleared too
+    }
+
+    static bool OnClearDepthStencilView(reshade::api::command_list* cmd_list, reshade::api::resource_view dsv, const float* depth, const uint8_t* stencil, uint32_t rect_count, const reshade::api::rect* rects)
+    {
+        ID3D11DeviceContext* ctx = GetImmediateNativeContext(cmd_list);
+        if (!ctx || dsv.handle == 0 || (!depth && !stencil)) return false;
+        ComPtr<ID3D11Device> dev;
+        ctx->GetDevice(dev.put());
+        std::scoped_lock lock(g_substitutes_mutex);
+        auto Create = [&](ID3D11Resource* r, const D3D11_DEPTH_STENCIL_VIEW_DESC* d, ID3D11DepthStencilView** o) { return dev->CreateDepthStencilView(r, d, o); };
+        // Depth substitutes are never "written" (the scene depth isn't upscaled), so this doesn't use the post TAA creation path
+        ComPtr<ID3D11Resource> resource;
+        reinterpret_cast<ID3D11DepthStencilView*>(dsv.handle)->GetResource(resource.put());
+        if (!g_substitutes.contains((uint64_t)resource.get())) return false;
+        if (auto* substitute = GetSubstituteView<ID3D11DepthStencilView, D3D11_DEPTH_STENCIL_VIEW_DESC>(dev.get(), reinterpret_cast<ID3D11DepthStencilView*>(dsv.handle), g_substitute_dsvs, false, false, Create))
+        {
+            UINT flags = (depth ? D3D11_CLEAR_DEPTH : 0) | (stencil ? D3D11_CLEAR_STENCIL : 0);
+            ctx->ClearDepthStencilView(substitute, flags, depth ? *depth : 0.f, stencil ? *stencil : 0);
+        }
+        return false;
+    }
+
+    static bool OnClearUnorderedAccessViewFloat(reshade::api::command_list* cmd_list, reshade::api::resource_view uav, const float values[4], uint32_t rect_count, const reshade::api::rect* rects)
+    {
+        ID3D11DeviceContext* ctx = GetImmediateNativeContext(cmd_list);
+        if (!ctx || uav.handle == 0) return false;
+        ComPtr<ID3D11Device> dev;
+        ctx->GetDevice(dev.put());
+        std::scoped_lock lock(g_substitutes_mutex);
+        auto Create = [&](ID3D11Resource* r, const D3D11_UNORDERED_ACCESS_VIEW_DESC* d, ID3D11UnorderedAccessView** o) { return dev->CreateUnorderedAccessView(r, d, o); };
+        if (auto* substitute = GetSubstituteViewForClear<ID3D11UnorderedAccessView, D3D11_UNORDERED_ACCESS_VIEW_DESC>(dev.get(), reinterpret_cast<ID3D11UnorderedAccessView*>(uav.handle), g_substitute_uavs, Create))
+            ctx->ClearUnorderedAccessViewFloat(substitute, values);
+        return false;
+    }
+
+    static bool OnClearUnorderedAccessViewUint(reshade::api::command_list* cmd_list, reshade::api::resource_view uav, const uint32_t values[4], uint32_t rect_count, const reshade::api::rect* rects)
+    {
+        ID3D11DeviceContext* ctx = GetImmediateNativeContext(cmd_list);
+        if (!ctx || uav.handle == 0) return false;
+        ComPtr<ID3D11Device> dev;
+        ctx->GetDevice(dev.put());
+        std::scoped_lock lock(g_substitutes_mutex);
+        auto Create = [&](ID3D11Resource* r, const D3D11_UNORDERED_ACCESS_VIEW_DESC* d, ID3D11UnorderedAccessView** o) { return dev->CreateUnorderedAccessView(r, d, o); };
+        if (auto* substitute = GetSubstituteViewForClear<ID3D11UnorderedAccessView, D3D11_UNORDERED_ACCESS_VIEW_DESC>(dev.get(), reinterpret_cast<ID3D11UnorderedAccessView*>(uav.handle), g_substitute_uavs, Create))
+            ctx->ClearUnorderedAccessViewUint(substitute, values);
+        return false;
     }
 
     // Full resolution substitute texture for a resized resource (created on demand, immediate context thread only)
@@ -726,6 +812,15 @@ public:
             ID3D11DepthStencilView* new_dsv = dsv;
             UINT rtv_count = 0;
             bool changed = false;
+            ResizedResourceInfo substituted_info;
+            bool has_substituted_info = false;
+            auto RememberInfo = [&](ID3D11View* view)
+            {
+                if (has_substituted_info) return;
+                ComPtr<ID3D11Resource> resource;
+                view->GetResource(resource.put());
+                has_substituted_info = GetResizedInfo(resource.get(), substituted_info);
+            };
             for (UINT i = 0; i < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; ++i)
             {
                 new_rtvs[i] = rtvs[i];
@@ -733,6 +828,7 @@ public:
                 rtv_count = i + 1;
                 if (auto* substitute = GetSubstituteView<ID3D11RenderTargetView, D3D11_RENDER_TARGET_VIEW_DESC>(dev, rtvs[i], g_substitute_rtvs, false, true, CreateRTV))
                 {
+                    RememberInfo(rtvs[i]);
                     new_rtvs[i] = substitute;
                     changed = true;
                 }
@@ -741,6 +837,7 @@ public:
             {
                 if (auto* substitute = GetSubstituteView<ID3D11DepthStencilView, D3D11_DEPTH_STENCIL_VIEW_DESC>(dev, dsv, g_substitute_dsvs, false, false, CreateDSV))
                 {
+                    RememberInfo(dsv);
                     new_dsv = substitute;
                     changed = true;
                     // The scene depth isn't upscaled (yet), so start from a cleared one (inverted depth: 0 is far) once per frame
@@ -755,7 +852,48 @@ public:
                 }
             }
             if (changed)
+            {
                 ctx->OMSetRenderTargetsAndUnorderedAccessViews(rtv_count, new_rtvs, new_dsv, D3D11_KEEP_UNORDERED_ACCESS_VIEWS, 0, nullptr, nullptr);
+
+                // The game sizes some post processing viewports from its (now small) textures: expand those to the full resolution substitute,
+                // otherwise they'd only fill its top left corner.
+                if (has_substituted_info)
+                {
+                    const float sw = (float)substituted_info.scaled_width, sh = (float)substituted_info.scaled_height;
+                    const float ow = (float)substituted_info.original_width, oh = (float)substituted_info.original_height;
+                    D3D11_VIEWPORT viewports[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
+                    UINT num_viewports = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
+                    ctx->RSGetViewports(&num_viewports, viewports);
+                    bool viewports_changed = false;
+                    for (UINT i = 0; i < num_viewports; ++i)
+                    {
+                        if (viewports[i].TopLeftX == 0.f && viewports[i].TopLeftY == 0.f && viewports[i].Width == sw && viewports[i].Height == sh)
+                        {
+                            viewports[i].Width = ow;
+                            viewports[i].Height = oh;
+                            viewports_changed = true;
+                        }
+                    }
+                    if (viewports_changed)
+                        ctx->RSSetViewports(num_viewports, viewports);
+
+                    D3D11_RECT scissors[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
+                    UINT num_scissors = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
+                    ctx->RSGetScissorRects(&num_scissors, scissors);
+                    bool scissors_changed = false;
+                    for (UINT i = 0; i < num_scissors; ++i)
+                    {
+                        if (scissors[i].left == 0 && scissors[i].top == 0 && scissors[i].right == (LONG)substituted_info.scaled_width && scissors[i].bottom == (LONG)substituted_info.scaled_height)
+                        {
+                            scissors[i].right = (LONG)substituted_info.original_width;
+                            scissors[i].bottom = (LONG)substituted_info.original_height;
+                            scissors_changed = true;
+                        }
+                    }
+                    if (scissors_changed)
+                        ctx->RSSetScissorRects(num_scissors, scissors);
+                }
+            }
             for (auto* rtv : rtvs) if (rtv) rtv->Release();
             if (dsv) dsv->Release();
 
@@ -972,7 +1110,9 @@ public:
             g_capture_state = CaptureState::Capturing;
         }
 
-        g_post_taa_phase = false;
+        // Frames without TAA (e.g. menus with no 3D scene) are all UI/2D, so we treat them as "post TAA" (full resolution) from the start.
+        // When the scene comes back, at most one frame has its pre TAA immediate passes at full resolution.
+        g_post_taa_phase = !g_taa_seen_this_frame.load();
         ++g_frame_index;
 
         g_taa_seen_last_frame = g_taa_seen_this_frame.load();
@@ -1224,7 +1364,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
     if (ul_reason_for_call == DLL_PROCESS_ATTACH)
     {
         Globals::SetGlobals(PROJECT_NAME, "Deus Ex: Mankind Divided Luma mod");
-        Globals::VERSION = 4;
+        Globals::VERSION = 5;
 
         // DLSS only: keep the game's original swapchain, texture formats and colors (no HDR, no display composition).
         swapchain_format_upgrade_type = TextureFormatUpgradesType::None;
