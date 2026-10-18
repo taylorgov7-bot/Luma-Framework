@@ -714,10 +714,11 @@ public:
             g_cbSharedPerViewData_mapped_data = *data;
         }
 
-        // Remember writes to small constant buffers, to patch screen sizes in them on unmap
-        if (IsScalingActive() && access != reshade::api::map_access::read_only && desc.ByteWidth <= k_max_patched_cbuffer_size)
+        // Remember constant buffer writes, to patch screen sizes in them on unmap.
+        // Only the start of each buffer is scanned (that's where per pass sizes are, e.g. the hair uses (w, h) at byte 224 of a ~2.5KB buffer).
+        if (IsScalingActive() && access != reshade::api::map_access::read_only)
         {
-            t_pending_maps.push_back({ resource.handle, *data, desc.ByteWidth });
+            t_pending_maps.push_back({ resource.handle, *data, (std::min)(desc.ByteWidth, k_max_patched_cbuffer_size) });
         }
     }
 
@@ -1417,7 +1418,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
     if (ul_reason_for_call == DLL_PROCESS_ATTACH)
     {
         Globals::SetGlobals(PROJECT_NAME, "Deus Ex: Mankind Divided Luma mod");
-        Globals::VERSION = 7;
+        Globals::VERSION = 8;
 
         // DLSS only: keep the game's original swapchain, texture formats and colors (no HDR, no display composition).
         swapchain_format_upgrade_type = TextureFormatUpgradesType::None;
