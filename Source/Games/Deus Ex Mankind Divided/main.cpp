@@ -15,6 +15,7 @@
 
 #include <fstream>
 #include <mutex>
+#include <shared_mutex>
 #include <sstream>
 #include <tuple>
 #include <unordered_map>
@@ -71,6 +72,130 @@ namespace
     std::atomic<bool> g_dlss_ran_this_frame = false;
     uint2 g_last_render_size = { 0, 0 };
     uint2 g_last_output_size = { 0, 0 };
+
+    // Render resolution scaling (experimental)
+    //
+    // The game has no resolution scaling of its own, so we emulate it:
+    // - Every screen-proportional render target/depth/UAV texture (full, 1/2, 1/4, 1/8 of the swapchain size) is created smaller,
+    //   so everything before TAA renders at the lower resolution. Viewports/scissors are scaled to match,
+    //   and the screen size constants the game uploads (e.g. 1/2560, 1/1440, 2560, 1440) are patched to the new sizes.
+    // - DLSS upscales into a full resolution substitute of the TAA output.
+    // - After TAA (UI, film grain, final), every resized texture the game binds is swapped for a full resolution substitute.
+    // The scale is decided when textures are created, so changes need a game restart.
+    struct ScalePresetInfo { const char* name; float scale; };
+    constexpr ScalePresetInfo k_scale_presets[] = {
+        { "DLAA (native resolution)", 1.f },
+        { "Quality (67%)", 2.f / 3.f },
+        { "Balanced (58%)", 0.58f },
+        { "Performance (50%)", 0.5f },
+        { "Ultra Performance (33%)", 1.f / 3.f },
+    };
+    constexpr int k_scale_presets_count = (int)std::size(k_scale_presets);
+    int g_selected_scale_preset = 0; // What the user picked (saved in the config)
+    int g_active_scale_preset = 0; // What the textures were created with this session (applied at startup)
+
+    float GetActiveScale() { return k_scale_presets[std::clamp(g_active_scale_preset, 0, k_scale_presets_count - 1)].scale; }
+    bool IsScalingActive() { return GetActiveScale() < 1.f; }
+
+    // The new size of a screen-proportional dimension (consistent between textures, viewports and constants)
+    uint32_t ScaleDimension(uint32_t value, uint32_t full, uint32_t scaled_full)
+    {
+        if (full == 0) return value;
+        return (std::max)(1u, (uint32_t)std::lround((double)value * (double)scaled_full / (double)full));
+    }
+    uint32_t GetScaledFullDimension(uint32_t full)
+    {
+        return (std::max)(1u, (uint32_t)std::lround((double)full * (double)GetActiveScale()));
+    }
+
+    // Base (swapchain) size the resizing was computed against
+    std::atomic<uint32_t> g_scale_base_width = 0;
+    std::atomic<uint32_t> g_scale_base_height = 0;
+
+    struct ResizedResourceInfo
+    {
+        uint32_t original_width = 0, original_height = 0;
+        uint32_t scaled_width = 0, scaled_height = 0;
+    };
+    std::shared_mutex g_resized_mutex;
+    std::unordered_map<uint64_t, ResizedResourceInfo> g_resized_resources;
+    std::atomic<uint32_t> g_resized_count = 0;
+    thread_local bool t_pending_resize = false;
+    thread_local ResizedResourceInfo t_pending_resize_info;
+
+    bool GetResizedInfo(ID3D11Resource* resource, ResizedResourceInfo& out)
+    {
+        if (!resource) return false;
+        std::shared_lock lock(g_resized_mutex);
+        auto it = g_resized_resources.find((uint64_t)resource);
+        if (it == g_resized_resources.end()) return false;
+        out = it->second;
+        return true;
+    }
+
+    // Full resolution substitutes of resized textures, used after TAA
+    struct Substitute
+    {
+        ComPtr<ID3D11Texture2D> texture;
+        uint64_t written_frame = UINT64_MAX;
+        uint64_t cleared_frame = UINT64_MAX;
+    };
+    std::mutex g_substitutes_mutex; // Only used on the immediate context thread, but resources can be destroyed from any thread
+    std::unordered_map<uint64_t, Substitute> g_substitutes; // By original resource
+    // Substitute views, by original view (each also remembers its original resource, to clean up)
+    template <typename T> struct SubstituteView { ComPtr<T> view; uint64_t original_resource = 0; };
+    std::unordered_map<uint64_t, SubstituteView<ID3D11RenderTargetView>> g_substitute_rtvs;
+    std::unordered_map<uint64_t, SubstituteView<ID3D11DepthStencilView>> g_substitute_dsvs;
+    std::unordered_map<uint64_t, SubstituteView<ID3D11ShaderResourceView>> g_substitute_srvs;
+    std::unordered_map<uint64_t, SubstituteView<ID3D11UnorderedAccessView>> g_substitute_uavs;
+
+    std::atomic<uint64_t> g_frame_index = 0;
+    // True on the immediate context between the game's TAA pass and the end of the frame
+    std::atomic<bool> g_post_taa_phase = false;
+    std::atomic<DWORD> g_immediate_thread_id = 0;
+
+    // Constant buffer writes are patched everywhere, except on the immediate context thread after TAA (post processing/UI run at full resolution).
+    bool ShouldPatchConstants()
+    {
+        if (!IsScalingActive()) return false;
+        return !(g_post_taa_phase && GetCurrentThreadId() == g_immediate_thread_id);
+    }
+
+    // Replaces adjacent (width, height) and (1/width, 1/height) pairs of screen-proportional sizes with the scaled ones
+    void PatchScreenSizeConstants(float* data, size_t float_count)
+    {
+        const uint32_t base_w = g_scale_base_width, base_h = g_scale_base_height;
+        if (base_w == 0 || base_h == 0 || float_count < 2) return;
+        const uint32_t scaled_w = GetScaledFullDimension(base_w), scaled_h = GetScaledFullDimension(base_h);
+
+        auto NearlyEqual = [](float a, float b) { return std::abs(a - b) <= std::abs(b) * 1e-5f; };
+        for (size_t i = 0; i + 1 < float_count; ++i)
+        {
+            const float x = data[i], y = data[i + 1];
+            if (x <= 0.f || y <= 0.f) continue;
+            for (uint32_t k = 0; k <= 3; ++k)
+            {
+                const uint32_t w = base_w >> k, h = base_h >> k;
+                if (w == 0 || h == 0) break;
+                const uint32_t new_w = ScaleDimension(w, base_w, scaled_w), new_h = ScaleDimension(h, base_h, scaled_h);
+                if (x == (float)w && y == (float)h)
+                {
+                    data[i] = (float)new_w; data[i + 1] = (float)new_h;
+                    ++i; break;
+                }
+                if (NearlyEqual(x, 1.f / (float)w) && NearlyEqual(y, 1.f / (float)h))
+                {
+                    data[i] = 1.f / (float)new_w; data[i + 1] = 1.f / (float)new_h;
+                    ++i; break;
+                }
+            }
+        }
+    }
+
+    // Pending constant buffer maps, per thread (Map/Unmap pairs happen on the same thread)
+    struct PendingMap { uint64_t resource; void* data; uint32_t size; };
+    thread_local std::vector<PendingMap> t_pending_maps;
+    constexpr uint32_t k_max_patched_cbuffer_size = 1024;
 
     // Diagnostics capture (records every draw/dispatch of one frame, so we can design render scaling)
     enum class CaptureState : int { Idle, Requested, Capturing };
@@ -165,7 +290,134 @@ public:
             reshade::register_event<reshade::addon_event::map_buffer_region>(GameDeusExMankindDivided::OnMapBufferRegion);
             reshade::register_event<reshade::addon_event::unmap_buffer_region>(GameDeusExMankindDivided::OnUnmapBufferRegion);
             reshade::register_event<reshade::addon_event::init_pipeline>(GameDeusExMankindDivided::OnInitPipelineStoreBytecode);
+            reshade::register_event<reshade::addon_event::create_resource>(GameDeusExMankindDivided::OnCreateResourceScale);
+            reshade::register_event<reshade::addon_event::init_resource>(GameDeusExMankindDivided::OnInitResourceScale);
+            reshade::register_event<reshade::addon_event::destroy_resource>(GameDeusExMankindDivided::OnDestroyResourceScale);
         }
+    }
+
+    // Shrinks screen-proportional render targets, depth buffers and UAV textures at creation
+    static bool OnCreateResourceScale(reshade::api::device* device, reshade::api::resource_desc& desc, reshade::api::subresource_data* initial_data, reshade::api::resource_usage initial_state)
+    {
+        t_pending_resize = false;
+        if (device->get_api() != reshade::api::device_api::d3d11) return false;
+        if (!IsScalingActive()) return false;
+        if (desc.type != reshade::api::resource_type::texture_2d) return false;
+        if (desc.texture.depth_or_layers != 1 || desc.texture.levels != 1 || desc.texture.samples != 1) return false;
+        if (initial_data && initial_data->data) return false;
+        if (desc.heap != reshade::api::memory_heap::gpu_only) return false;
+        const bool is_target = (desc.usage & reshade::api::resource_usage::render_target) == reshade::api::resource_usage::render_target
+            || (desc.usage & reshade::api::resource_usage::depth_stencil) == reshade::api::resource_usage::depth_stencil
+            || (desc.usage & reshade::api::resource_usage::unordered_access) == reshade::api::resource_usage::unordered_access;
+        if (!is_target) return false;
+
+        DeviceData* device_data = device->get_private_data<DeviceData>();
+        if (!device_data) return false;
+        const uint32_t base_w = (uint32_t)device_data->output_resolution.x, base_h = (uint32_t)device_data->output_resolution.y;
+        if (base_w <= 16 || base_h <= 16) return false; // Swapchain not known yet
+
+        for (uint32_t k = 0; k <= 3; ++k)
+        {
+            const uint32_t w = base_w >> k, h = base_h >> k;
+            if (desc.texture.width != w || desc.texture.height != h) continue;
+
+            g_scale_base_width = base_w;
+            g_scale_base_height = base_h;
+            const uint32_t scaled_w = GetScaledFullDimension(base_w), scaled_h = GetScaledFullDimension(base_h);
+            t_pending_resize_info = { w, h, ScaleDimension(w, base_w, scaled_w), ScaleDimension(h, base_h, scaled_h) };
+            desc.texture.width = t_pending_resize_info.scaled_width;
+            desc.texture.height = t_pending_resize_info.scaled_height;
+            t_pending_resize = true;
+            return true;
+        }
+        return false;
+    }
+
+    static void OnInitResourceScale(reshade::api::device* device, const reshade::api::resource_desc& desc, const reshade::api::subresource_data* initial_data, reshade::api::resource_usage initial_state, reshade::api::resource resource)
+    {
+        if (!t_pending_resize) return;
+        t_pending_resize = false;
+        if (desc.type != reshade::api::resource_type::texture_2d || desc.texture.width != t_pending_resize_info.scaled_width || desc.texture.height != t_pending_resize_info.scaled_height) return;
+        std::unique_lock lock(g_resized_mutex);
+        g_resized_resources[resource.handle] = t_pending_resize_info;
+        g_resized_count = (uint32_t)g_resized_resources.size();
+    }
+
+    static void OnDestroyResourceScale(reshade::api::device* device, reshade::api::resource resource)
+    {
+        {
+            std::unique_lock lock(g_resized_mutex);
+            if (g_resized_resources.erase(resource.handle) == 0) return;
+            g_resized_count = (uint32_t)g_resized_resources.size();
+        }
+        std::scoped_lock lock(g_substitutes_mutex);
+        g_substitutes.erase(resource.handle);
+        auto EraseViews = [&](auto& views) { std::erase_if(views, [&](const auto& pair) { return pair.second.original_resource == resource.handle; }); };
+        EraseViews(g_substitute_rtvs);
+        EraseViews(g_substitute_dsvs);
+        EraseViews(g_substitute_srvs);
+        EraseViews(g_substitute_uavs);
+    }
+
+    // Full resolution substitute texture for a resized resource (created on demand, immediate context thread only)
+    static Substitute* GetSubstitute(ID3D11Device* native_device, ID3D11Resource* original, const ResizedResourceInfo& info)
+    {
+        auto it = g_substitutes.find((uint64_t)original);
+        if (it != g_substitutes.end())
+            return &it->second;
+        ComPtr<ID3D11Texture2D> original_texture;
+        if (FAILED(original->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(original_texture.put()))) || !original_texture)
+            return nullptr;
+        D3D11_TEXTURE2D_DESC desc;
+        original_texture->GetDesc(&desc);
+        desc.Width = info.original_width;
+        desc.Height = info.original_height;
+        Substitute substitute;
+        if (FAILED(native_device->CreateTexture2D(&desc, nullptr, substitute.texture.put())))
+            return nullptr;
+        return &g_substitutes.emplace((uint64_t)original, std::move(substitute)).first->second;
+    }
+
+    // Returns the substitute view for "view" if its resource was resized (nullptr otherwise).
+    // "require_written" is for reads: only substitute if the full resolution copy has content this frame.
+    template <typename ViewT, typename DescT, typename CreateFunc>
+    static ViewT* GetSubstituteView(ID3D11Device* native_device, ViewT* view, std::unordered_map<uint64_t, SubstituteView<ViewT>>& cache, bool require_written, bool mark_written, CreateFunc create)
+    {
+        if (!view) return nullptr;
+        ComPtr<ID3D11Resource> resource;
+        view->GetResource(resource.put());
+        ResizedResourceInfo info;
+        if (!GetResizedInfo(resource.get(), info)) return nullptr;
+
+        const uint64_t frame = g_frame_index;
+        Substitute* substitute = nullptr;
+        if (require_written)
+        {
+            // Reads never create a substitute, the small original is still sampled correctly (by UV)
+            auto existing = g_substitutes.find((uint64_t)resource.get());
+            if (existing == g_substitutes.end() || existing->second.written_frame != frame) return nullptr;
+            substitute = &existing->second;
+        }
+        else
+        {
+            substitute = GetSubstitute(native_device, resource.get(), info);
+            if (!substitute) return nullptr;
+        }
+        if (mark_written) substitute->written_frame = frame;
+
+        auto it = cache.find((uint64_t)view);
+        if (it != cache.end() && it->second.original_resource == (uint64_t)resource.get())
+            return it->second.view.get();
+
+        DescT view_desc;
+        view->GetDesc(&view_desc);
+        SubstituteView<ViewT> entry;
+        entry.original_resource = (uint64_t)resource.get();
+        if (FAILED(create(substitute->texture.get(), &view_desc, entry.view.put())))
+            return nullptr;
+        ViewT* result = entry.view.get();
+        cache[(uint64_t)view] = std::move(entry);
+        return result;
     }
 
     static void OnInitPipelineStoreBytecode(reshade::api::device* device, reshade::api::pipeline_layout layout, uint32_t subobject_count, const reshade::api::pipeline_subobject* subobjects, reshade::api::pipeline pipeline)
@@ -202,6 +454,17 @@ public:
     void LoadConfigs() override
     {
         reshade::get_config_value(nullptr, NAME, "DisableLastKnownLocation", g_disable_last_known_location);
+
+        int preset = 0;
+        reshade::get_config_value(nullptr, NAME, "RenderScalePreset", preset);
+        g_selected_scale_preset = std::clamp(preset, 0, k_scale_presets_count - 1);
+        // The textures are sized when the game creates them, so the active preset is only taken from the config once, at boot
+        static bool s_active_preset_loaded = false;
+        if (!s_active_preset_loaded)
+        {
+            g_active_scale_preset = g_selected_scale_preset;
+            s_active_preset_loaded = true;
+        }
     }
 
     void DrawImGuiSettings(DeviceData& device_data) override
@@ -226,7 +489,33 @@ public:
         {
             ImGui::TextColored(ImVec4(1.f, 0.6f, 0.2f, 1.f), "DLSS: TAA found but DLSS couldn't run this frame (camera data missing).");
         }
-        ImGui::TextDisabled("Upscaling presets (Quality/Balanced/Performance) are coming in the next build.");
+        ImGui::NewLine();
+        ImGui::SetNextItemWidth(260.f);
+        if (ImGui::BeginCombo("Upscaling (experimental)", k_scale_presets[g_selected_scale_preset].name))
+        {
+            for (int i = 0; i < k_scale_presets_count; ++i)
+            {
+                const bool selected = i == g_selected_scale_preset;
+                if (ImGui::Selectable(k_scale_presets[i].name, selected))
+                {
+                    g_selected_scale_preset = i;
+                    reshade::set_config_value(nullptr, NAME, "RenderScalePreset", g_selected_scale_preset);
+                }
+                if (selected)
+                    ImGui::SetItemDefaultFocus();
+            }
+            ImGui::EndCombo();
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Renders the 3D scene at a lower resolution and lets DLSS upscale it. The UI and final image stay at full resolution.");
+        if (g_selected_scale_preset != g_active_scale_preset)
+            ImGui::TextColored(ImVec4(1.f, 0.8f, 0.2f, 1.f), "Restart the game to apply (currently running: %s).", k_scale_presets[g_active_scale_preset].name);
+        if (IsScalingActive())
+        {
+            ImGui::Text("Resized textures: %u", g_resized_count.load());
+            if (device_data.sr_type == SR::Type::None)
+                ImGui::TextColored(ImVec4(1.f, 0.6f, 0.2f, 1.f), "DLSS is off, so the scene is just stretched from the lower resolution.");
+        }
 
         ImGui::NewLine();
 
@@ -277,16 +566,35 @@ public:
         auto buffer = (ID3D11Buffer*)resource.handle;
         D3D11_BUFFER_DESC desc;
         buffer->GetDesc(&desc);
-        if (desc.BindFlags == D3D11_BIND_CONSTANT_BUFFER && desc.ByteWidth == 544)
+        if (desc.BindFlags != D3D11_BIND_CONSTANT_BUFFER || !data || !*data)
+            return;
+
+        if (desc.ByteWidth == 544)
         {
             g_cbSharedPerViewData_handle = resource.handle;
             g_cbSharedPerViewData_mapped_data = *data;
+        }
+
+        // Remember writes to small constant buffers, to patch screen sizes in them on unmap
+        if (IsScalingActive() && access != reshade::api::map_access::read_only && desc.ByteWidth <= k_max_patched_cbuffer_size)
+        {
+            t_pending_maps.push_back({ resource.handle, *data, desc.ByteWidth });
         }
     }
 
     static void OnUnmapBufferRegion(reshade::api::device* device, reshade::api::resource resource)
     {
         SKIP_UNSUPPORTED_DEVICE_API(device->get_api());
+
+        for (size_t i = 0; i < t_pending_maps.size(); ++i)
+        {
+            if (t_pending_maps[i].resource != resource.handle) continue;
+            const PendingMap pending = t_pending_maps[i];
+            t_pending_maps.erase(t_pending_maps.begin() + i);
+            if (ShouldPatchConstants())
+                PatchScreenSizeConstants(static_cast<float*>(pending.data), pending.size / sizeof(float));
+            break;
+        }
 
         // Not thread safe, but it looks like it's fine.
         if (g_cbSharedPerViewData_handle == resource.handle)
@@ -299,6 +607,183 @@ public:
                 std::memcpy(&g_cbSharedPerViewData_data, data, sizeof(g_cbSharedPerViewData_data));
                 g_cbSharedPerViewData_handle = 0;
             }
+        }
+    }
+
+    // Before TAA: draws into resized targets need their (full resolution) viewports and scissors scaled down
+    static void ScaleViewportsForResizedTargets(ID3D11DeviceContext* ctx, CommandListData& cmd_list_data)
+    {
+        if (cmd_list_data.viewports_scaled && cmd_list_data.scissors_scaled)
+            return;
+
+        ID3D11RenderTargetView* rtvs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
+        ID3D11DepthStencilView* dsv = nullptr;
+        ctx->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, rtvs, &dsv);
+        ResizedResourceInfo info;
+        bool found = false;
+        auto Check = [&](ID3D11View* view)
+        {
+            if (!view || found) return;
+            ComPtr<ID3D11Resource> resource;
+            view->GetResource(resource.put());
+            found = GetResizedInfo(resource.get(), info);
+        };
+        for (auto* rtv : rtvs) Check(rtv);
+        Check(dsv);
+        for (auto* rtv : rtvs) if (rtv) rtv->Release();
+        if (dsv) dsv->Release();
+        if (!found || info.original_width == 0 || info.original_height == 0)
+            return;
+
+        const float scale_x = (float)info.scaled_width / (float)info.original_width;
+        const float scale_y = (float)info.scaled_height / (float)info.original_height;
+
+        if (!cmd_list_data.viewports_scaled)
+        {
+            D3D11_VIEWPORT viewports[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
+            UINT num_viewports = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
+            ctx->RSGetViewports(&num_viewports, viewports);
+            bool changed = false;
+            for (UINT i = 0; i < num_viewports; i++)
+            {
+                if (viewports[i].Width == 0.f || viewports[i].Height == 0.f) continue;
+                // Scale the edges and round them, so tiled viewports stay tiled
+                const float left = std::round(viewports[i].TopLeftX * scale_x);
+                const float top = std::round(viewports[i].TopLeftY * scale_y);
+                const float right = std::round((viewports[i].TopLeftX + viewports[i].Width) * scale_x);
+                const float bottom = std::round((viewports[i].TopLeftY + viewports[i].Height) * scale_y);
+                viewports[i].TopLeftX = left;
+                viewports[i].TopLeftY = top;
+                viewports[i].Width = (std::max)(1.f, right - left);
+                viewports[i].Height = (std::max)(1.f, bottom - top);
+                changed = true;
+            }
+            if (changed)
+                ctx->RSSetViewports(num_viewports, viewports);
+            cmd_list_data.viewports_scaled = true;
+        }
+        if (!cmd_list_data.scissors_scaled)
+        {
+            D3D11_RECT scissors[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
+            UINT num_scissors = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
+            ctx->RSGetScissorRects(&num_scissors, scissors);
+            bool changed = false;
+            for (UINT i = 0; i < num_scissors; i++)
+            {
+                if (scissors[i].right == scissors[i].left || scissors[i].bottom == scissors[i].top) continue;
+                scissors[i].left = std::lround(scissors[i].left * scale_x);
+                scissors[i].top = std::lround(scissors[i].top * scale_y);
+                scissors[i].right = std::lround(scissors[i].right * scale_x);
+                scissors[i].bottom = std::lround(scissors[i].bottom * scale_y);
+                changed = true;
+            }
+            if (changed)
+                ctx->RSSetScissorRects(num_scissors, scissors);
+            cmd_list_data.scissors_scaled = true;
+        }
+    }
+
+    // After TAA: swap every resized texture the game binds for its full resolution substitute
+    static void ApplyPostTaaSubstitutes(ID3D11Device* dev, ID3D11DeviceContext* ctx, bool is_dispatch)
+    {
+        std::scoped_lock lock(g_substitutes_mutex);
+        const uint64_t frame = g_frame_index;
+
+        auto CreateRTV = [dev](ID3D11Resource* r, const D3D11_RENDER_TARGET_VIEW_DESC* d, ID3D11RenderTargetView** o) { return dev->CreateRenderTargetView(r, d, o); };
+        auto CreateDSV = [dev](ID3D11Resource* r, const D3D11_DEPTH_STENCIL_VIEW_DESC* d, ID3D11DepthStencilView** o) { return dev->CreateDepthStencilView(r, d, o); };
+        auto CreateSRV = [dev](ID3D11Resource* r, const D3D11_SHADER_RESOURCE_VIEW_DESC* d, ID3D11ShaderResourceView** o) { return dev->CreateShaderResourceView(r, d, o); };
+        auto CreateUAV = [dev](ID3D11Resource* r, const D3D11_UNORDERED_ACCESS_VIEW_DESC* d, ID3D11UnorderedAccessView** o) { return dev->CreateUnorderedAccessView(r, d, o); };
+
+        // Shader resources (only substituted if the full resolution copy was written this frame, otherwise the small one is still sampled correctly by UV)
+        auto SubstituteSRVs = [&](auto get, auto set)
+        {
+            constexpr UINT count = D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT;
+            ID3D11ShaderResourceView* srvs[count] = {};
+            get(0, count, srvs);
+            bool changed = false;
+            for (UINT i = 0; i < count; ++i)
+            {
+                if (!srvs[i]) continue;
+                if (auto* substitute = GetSubstituteView<ID3D11ShaderResourceView, D3D11_SHADER_RESOURCE_VIEW_DESC>(dev, srvs[i], g_substitute_srvs, true, false, CreateSRV))
+                {
+                    srvs[i]->Release();
+                    srvs[i] = substitute;
+                    substitute->AddRef();
+                    changed = true;
+                }
+            }
+            if (changed)
+                set(0, count, srvs);
+            for (auto* srv : srvs) if (srv) srv->Release();
+        };
+
+        if (!is_dispatch)
+        {
+            ID3D11RenderTargetView* rtvs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
+            ID3D11DepthStencilView* dsv = nullptr;
+            ctx->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, rtvs, &dsv);
+            ID3D11RenderTargetView* new_rtvs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
+            ID3D11DepthStencilView* new_dsv = dsv;
+            UINT rtv_count = 0;
+            bool changed = false;
+            for (UINT i = 0; i < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; ++i)
+            {
+                new_rtvs[i] = rtvs[i];
+                if (!rtvs[i]) continue;
+                rtv_count = i + 1;
+                if (auto* substitute = GetSubstituteView<ID3D11RenderTargetView, D3D11_RENDER_TARGET_VIEW_DESC>(dev, rtvs[i], g_substitute_rtvs, false, true, CreateRTV))
+                {
+                    new_rtvs[i] = substitute;
+                    changed = true;
+                }
+            }
+            if (dsv)
+            {
+                if (auto* substitute = GetSubstituteView<ID3D11DepthStencilView, D3D11_DEPTH_STENCIL_VIEW_DESC>(dev, dsv, g_substitute_dsvs, false, false, CreateDSV))
+                {
+                    new_dsv = substitute;
+                    changed = true;
+                    // The scene depth isn't upscaled (yet), so start from a cleared one (inverted depth: 0 is far) once per frame
+                    ComPtr<ID3D11Resource> resource;
+                    dsv->GetResource(resource.put());
+                    auto it = g_substitutes.find((uint64_t)resource.get());
+                    if (it != g_substitutes.end() && it->second.cleared_frame != frame)
+                    {
+                        ctx->ClearDepthStencilView(substitute, D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 0.f, 0);
+                        it->second.cleared_frame = frame;
+                    }
+                }
+            }
+            if (changed)
+                ctx->OMSetRenderTargetsAndUnorderedAccessViews(rtv_count, new_rtvs, new_dsv, D3D11_KEEP_UNORDERED_ACCESS_VIEWS, 0, nullptr, nullptr);
+            for (auto* rtv : rtvs) if (rtv) rtv->Release();
+            if (dsv) dsv->Release();
+
+            SubstituteSRVs([ctx](UINT s, UINT n, ID3D11ShaderResourceView** v) { ctx->PSGetShaderResources(s, n, v); }, [ctx](UINT s, UINT n, ID3D11ShaderResourceView** v) { ctx->PSSetShaderResources(s, n, v); });
+            SubstituteSRVs([ctx](UINT s, UINT n, ID3D11ShaderResourceView** v) { ctx->VSGetShaderResources(s, n, v); }, [ctx](UINT s, UINT n, ID3D11ShaderResourceView** v) { ctx->VSSetShaderResources(s, n, v); });
+        }
+        else
+        {
+            constexpr UINT uav_count = D3D11_PS_CS_UAV_REGISTER_COUNT;
+            ID3D11UnorderedAccessView* uavs[uav_count] = {};
+            ctx->CSGetUnorderedAccessViews(0, uav_count, uavs);
+            bool changed = false;
+            for (UINT i = 0; i < uav_count; ++i)
+            {
+                if (!uavs[i]) continue;
+                if (auto* substitute = GetSubstituteView<ID3D11UnorderedAccessView, D3D11_UNORDERED_ACCESS_VIEW_DESC>(dev, uavs[i], g_substitute_uavs, false, true, CreateUAV))
+                {
+                    uavs[i]->Release();
+                    uavs[i] = substitute;
+                    substitute->AddRef();
+                    changed = true;
+                }
+            }
+            if (changed)
+                ctx->CSSetUnorderedAccessViews(0, uav_count, uavs, nullptr);
+            for (auto* uav : uavs) if (uav) uav->Release();
+
+            SubstituteSRVs([ctx](UINT s, UINT n, ID3D11ShaderResourceView** v) { ctx->CSGetShaderResources(s, n, v); }, [ctx](UINT s, UINT n, ID3D11ShaderResourceView** v) { ctx->CSSetShaderResources(s, n, v); });
         }
     }
 
@@ -367,6 +852,7 @@ public:
         ss << "Luma DXMD diagnostics\n";
         ss << "Output resolution: " << device_data.output_resolution.x << "x" << device_data.output_resolution.y << "\n";
         ss << "Render resolution (core): " << device_data.render_resolution.x << "x" << device_data.render_resolution.y << "\n";
+        ss << "Scale preset (active): " << g_active_scale_preset << "  resized textures: " << g_resized_count.load() << "  scale base: " << g_scale_base_width.load() << "x" << g_scale_base_height.load() << "\n";
         ss << "SR type: " << (int)device_data.sr_type << "  TAA seen: " << (g_taa_seen_this_frame ? 1 : 0) << "\n";
         ss << "Last DLSS sizes: render " << g_last_render_size.x << "x" << g_last_render_size.y << " output " << g_last_output_size.x << "x" << g_last_output_size.y << "\n";
         const auto& cb = g_cbSharedPerViewData_data;
@@ -486,6 +972,9 @@ public:
             g_capture_state = CaptureState::Capturing;
         }
 
+        g_post_taa_phase = false;
+        ++g_frame_index;
+
         g_taa_seen_last_frame = g_taa_seen_this_frame.load();
         g_taa_seen_this_frame = false;
         g_dlss_ran_last_frame = g_dlss_ran_this_frame.load();
@@ -524,6 +1013,18 @@ public:
             RecordPass(native_device_context, original_shader_hashes, is_dispatch, is_taa);
         }
 
+        const bool is_immediate = native_device_context->GetType() == D3D11_DEVICE_CONTEXT_IMMEDIATE;
+        if (is_immediate)
+            g_immediate_thread_id = GetCurrentThreadId();
+
+        if (IsScalingActive() && !is_taa && !is_custom_pass)
+        {
+            if (is_immediate && g_post_taa_phase)
+                ApplyPostTaaSubstitutes(native_device, native_device_context, is_dispatch);
+            else if (!is_dispatch)
+                ScaleViewportsForResizedTargets(native_device_context, cmd_list_data);
+        }
+
         if (original_shader_hashes.Contains(shader_hashes_LastKnownLocation))
         {
             if (g_disable_last_known_location)
@@ -540,6 +1041,9 @@ public:
 
         g_taa_seen_this_frame = true;
         device_data.taa_detected = true;
+        // Everything after this on the immediate context is post processing/UI, at full resolution
+        if (is_immediate)
+            g_post_taa_phase = true;
 
         if (device_data.sr_type == SR::Type::None || device_data.sr_suppressed)
         {
@@ -585,9 +1089,30 @@ public:
         ComPtr<ID3D11Resource> resource_output;
         uav->GetResource(resource_output.put());
 
-        // Use the real texture sizes rather than the swapchain size, so this keeps working once the scene renders at a lower resolution.
+        // When the scene renders at a lower resolution, DLSS writes into the full resolution substitute of the TAA output,
+        // which the post processing/UI then reads (see "ApplyPostTaaSubstitutes()").
+        ID3D11Resource* dlss_output = resource_output.get();
+        ID3D11UnorderedAccessView* dlss_output_uav = uav.get();
+        {
+            ResizedResourceInfo resized_info;
+            if (GetResizedInfo(resource_output.get(), resized_info))
+            {
+                std::scoped_lock lock(g_substitutes_mutex);
+                auto CreateUAV = [native_device](ID3D11Resource* r, const D3D11_UNORDERED_ACCESS_VIEW_DESC* d, ID3D11UnorderedAccessView** o) { return native_device->CreateUnorderedAccessView(r, d, o); };
+                ID3D11UnorderedAccessView* substitute_uav = GetSubstituteView<ID3D11UnorderedAccessView, D3D11_UNORDERED_ACCESS_VIEW_DESC>(native_device, uav.get(), g_substitute_uavs, false, true, CreateUAV);
+                auto it = g_substitutes.find((uint64_t)resource_output.get());
+                if (!substitute_uav || it == g_substitutes.end())
+                {
+                    return DrawOrDispatchOverrideType::None; // Couldn't create it, let the native TAA run (lower resolution output)
+                }
+                dlss_output = it->second.texture.get();
+                dlss_output_uav = substitute_uav;
+            }
+        }
+
+        // Use the real texture sizes rather than the swapchain size, as the scene can render at a lower resolution.
         const TexInfo scene_info = GetTexInfo(resource_scene.get());
-        const TexInfo output_info = GetTexInfo(resource_output.get());
+        const TexInfo output_info = GetTexInfo(dlss_output);
         if (!scene_info.valid || !output_info.valid)
         {
             return DrawOrDispatchOverrideType::None;
@@ -623,7 +1148,7 @@ public:
 
         SR::SuperResolutionImpl::DrawData draw_data;
         draw_data.source_color = resource_scene.get();
-        draw_data.output_color = resource_output.get();
+        draw_data.output_color = dlss_output;
         draw_data.motion_vectors = resource_mvs.get();
         draw_data.depth_buffer = resource_depth.get();
         draw_data.reset = device_data.force_reset_sr;
@@ -648,6 +1173,14 @@ public:
             ID3D11UnorderedAccessView* raw_uav = uav.get();
             native_device_context->CSSetUnorderedAccessViews(0, 1, &raw_uav, nullptr);
             device_data.force_reset_sr = true;
+            if (dlss_output != resource_output.get())
+            {
+                // The substitute has no content this frame, so post processing keeps reading the native (low resolution) TAA output
+                std::scoped_lock lock(g_substitutes_mutex);
+                auto it = g_substitutes.find((uint64_t)resource_output.get());
+                if (it != g_substitutes.end())
+                    it->second.written_frame = UINT64_MAX;
+            }
             return DrawOrDispatchOverrideType::None;
         }
 
@@ -662,7 +1195,7 @@ public:
         {
             ID3D11ShaderResourceView* null_srvs[4] = {};
             native_device_context->CSSetShaderResources(0, 4, null_srvs); // Avoid read/write hazards on the output texture
-            ID3D11UnorderedAccessView* raw_uav = uav.get();
+            ID3D11UnorderedAccessView* raw_uav = dlss_output_uav;
             native_device_context->CSSetUnorderedAccessViews(0, 1, &raw_uav, nullptr);
             native_device_context->CSSetShader(device_data.native_compute_shaders[CompileTimeStringHash("DeusExMD Post DLSS CS")].get(), nullptr, 0);
             native_device_context->Dispatch((output_width + 8 - 1) / 8, (output_height + 8 - 1) / 8, 1);
@@ -691,7 +1224,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
     if (ul_reason_for_call == DLL_PROCESS_ATTACH)
     {
         Globals::SetGlobals(PROJECT_NAME, "Deus Ex: Mankind Divided Luma mod");
-        Globals::VERSION = 3;
+        Globals::VERSION = 4;
 
         // DLSS only: keep the game's original swapchain, texture formats and colors (no HDR, no display composition).
         swapchain_format_upgrade_type = TextureFormatUpgradesType::None;
